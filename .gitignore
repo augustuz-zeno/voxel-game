@@ -1,1 +1,17 @@
 /target
+Cargo.lock
+
+# Environments and Sensitive Data
+.env
+.env.*
+*.pem
+*.key
+secret/
+secrets/
+config/local.json
+
+# IDE / OS Files
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db

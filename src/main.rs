@@ -478,7 +478,7 @@ fn setup_world(mut commands: Commands, mut world_mgr: ResMut<WorldManager>) {
                         order: 0,
                         ..default()
                     },
-                    transform: Transform::from_xyz(0.0, 0.7, 0.0),
+                    transform: Transform::from_xyz(0.0, 1.6, 0.0),
                     ..default()
                 },
                 PlayerCamera,
@@ -729,7 +729,7 @@ fn player_move(
         physics.velocity.y = physics.velocity.y.max(-50.0); // terminal velocity
 
         // Jump
-        if keys.just_pressed(KeyCode::Space) && physics.on_ground {
+        if keys.pressed(KeyCode::Space) && physics.on_ground {
             physics.velocity.y = JUMP_VELOCITY;
             physics.on_ground = false;
         }
