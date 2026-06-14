@@ -5,6 +5,7 @@
 // =============================================================================
 
 use bevy::{
+    diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     input::mouse::MouseMotion,
     math::Vec3A,
     prelude::*,
@@ -13,7 +14,7 @@ use bevy::{
         primitives::{Frustum, Sphere},
         render_asset::RenderAssetUsages,
     },
-    window::{CursorGrabMode, WindowPlugin},
+    window::{CursorGrabMode, PresentMode, WindowPlugin},
 };
 
 // =============================================================================
@@ -28,10 +29,19 @@ const MOUSE_SENSITIVITY: f32 = 0.002;
 const MOVE_SPEED: f32 = 8.0;
 const SPRINT_MULTIPLIER: f32 = 3.0;
 
+const GRAVITY: f32 = 24.0;
+const JUMP_VELOCITY: f32 = 8.5;
+const PLAYER_WIDTH: f32 = 0.6;
+const PLAYER_HEIGHT: f32 = 1.8;
+const FLY_TOGGLE_TIME: f32 = 0.3;
+
 const SEED: u64 = 42;
 const TERRAIN_SCALE: f64 = 0.07;
 const TERRAIN_HEIGHT: f64 = 12.0;
 const WATER_LEVEL: usize = 4;
+
+/// Type alias for face data — fixes clippy::type_complexity
+type FaceData = ([i32; 3], [[f32; 3]; 4], [f32; 3]);
 
 // =============================================================================
 // APP STATE
@@ -98,6 +108,11 @@ impl BlockType {
             (b[2] * brightness).min(1.0),
             b[3],
         ]
+    }
+
+    /// Returns true if the block is solid for collision purposes.
+    pub fn is_solid(self) -> bool {
+        !matches!(self, BlockType::Air | BlockType::Water)
     }
 }
 
@@ -261,7 +276,7 @@ pub fn build_chunk_mesh(chunk: &ChunkData) -> Mesh {
     let mut colors: Vec<[f32; 4]> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
 
-    const FACES: [([i32; 3], [[f32; 3]; 4], [f32; 3]); 6] = [
+    const FACES: [FaceData; 6] = [
         (
             [1, 0, 0],
             [[1., 0., 0.], [1., 1., 0.], [1., 1., 1.], [1., 0., 1.]],
@@ -373,7 +388,38 @@ struct Player {
 }
 
 #[derive(Component)]
+struct PlayerPhysics {
+    velocity: Vec3,
+    on_ground: bool,
+    fly_mode: bool,
+    last_space_time: f32,
+}
+
+impl Default for PlayerPhysics {
+    fn default() -> Self {
+        Self {
+            velocity: Vec3::ZERO,
+            on_ground: false,
+            fly_mode: false,
+            last_space_time: 0.0,
+        }
+    }
+}
+
+#[derive(Component)]
 struct PlayerCamera;
+
+// =============================================================================
+// DEBUG OVERLAY
+// =============================================================================
+
+#[derive(Resource, Default)]
+struct DebugState {
+    visible: bool,
+}
+
+#[derive(Component)]
+struct DebugOverlay;
 
 // =============================================================================
 // WORLD MANAGER
@@ -420,6 +466,7 @@ fn setup_world(mut commands: Commands, mut world_mgr: ResMut<WorldManager>) {
                 pitch: 0.0,
                 yaw: 0.0,
             },
+            PlayerPhysics::default(),
             InGameEntity,
             TransformBundle::from(Transform::from_xyz(0.0, spawn_y, 0.0)),
             VisibilityBundle::default(),
@@ -510,6 +557,72 @@ fn rebuild_dirty_chunks(
 }
 
 // =============================================================================
+// COLLISION HELPERS
+// =============================================================================
+
+/// Look up a block at world coordinates by finding the corresponding chunk.
+fn get_world_block(wx: i32, wy: i32, wz: i32, chunks_q: &Query<&Chunk>) -> BlockType {
+    if wy < 0 {
+        return BlockType::Bedrock; // below world = solid
+    }
+    let cx = wx.div_euclid(CHUNK_SIZE as i32);
+    let cy = wy.div_euclid(CHUNK_SIZE as i32);
+    let cz = wz.div_euclid(CHUNK_SIZE as i32);
+    let lx = wx.rem_euclid(CHUNK_SIZE as i32) as usize;
+    let ly = wy.rem_euclid(CHUNK_SIZE as i32) as usize;
+    let lz = wz.rem_euclid(CHUNK_SIZE as i32) as usize;
+
+    let grid = IVec3::new(cx, cy, cz);
+    for chunk in chunks_q.iter() {
+        if chunk.grid_pos == grid {
+            return chunk.data.get(lx, ly, lz);
+        }
+    }
+    BlockType::Air
+}
+
+/// Check if a player AABB at `pos` (feet position) collides with any solid block.
+fn check_aabb_collision(
+    pos: Vec3,
+    half_w: f32,
+    height: f32,
+    chunks_q: &Query<&Chunk>,
+) -> bool {
+    let min_bx = (pos.x - half_w).floor() as i32;
+    let max_bx = (pos.x + half_w - 0.001).floor() as i32;
+    let min_by = pos.y.floor() as i32;
+    let max_by = (pos.y + height - 0.001).floor() as i32;
+    let min_bz = (pos.z - half_w).floor() as i32;
+    let max_bz = (pos.z + half_w - 0.001).floor() as i32;
+
+    for by in min_by..=max_by {
+        for bz in min_bz..=max_bz {
+            for bx in min_bx..=max_bx {
+                let block = get_world_block(bx, by, bz, chunks_q);
+                if block.is_solid() {
+                    // Precise AABB overlap test
+                    let bmin = Vec3::new(bx as f32, by as f32, bz as f32);
+                    let bmax = bmin + Vec3::ONE;
+                    let pmin = Vec3::new(pos.x - half_w, pos.y, pos.z - half_w);
+                    let pmax = Vec3::new(pos.x + half_w, pos.y + height, pos.z + half_w);
+
+                    if pmin.x < bmax.x
+                        && pmax.x > bmin.x
+                        && pmin.y < bmax.y
+                        && pmax.y > bmin.y
+                        && pmin.z < bmax.z
+                        && pmax.z > bmin.z
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+// =============================================================================
 // PLAYER CONTROLS
 // =============================================================================
 
@@ -548,40 +661,115 @@ fn player_look(
 fn player_move(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
-    mut player_q: Query<(&mut Transform, &Player)>,
+    mut player_q: Query<(&mut Transform, &Player, &mut PlayerPhysics)>,
+    chunks_q: Query<&Chunk>,
 ) {
-    let Ok((mut tf, _)) = player_q.get_single_mut() else {
+    let Ok((mut tf, _, mut physics)) = player_q.get_single_mut() else {
         return;
     };
+
+    let dt = time.delta_seconds();
+    if dt <= 0.0 {
+        return;
+    }
     let sprint = keys.pressed(KeyCode::ControlLeft);
     let speed = MOVE_SPEED * if sprint { SPRINT_MULTIPLIER } else { 1.0 };
-    let dt = time.delta_seconds();
 
+    // ── Fly mode toggle (double-tap Space) ──
+    if keys.just_pressed(KeyCode::Space) {
+        let now = time.elapsed_seconds();
+        if physics.last_space_time > 0.0 && (now - physics.last_space_time) < FLY_TOGGLE_TIME {
+            physics.fly_mode = !physics.fly_mode;
+            physics.velocity = Vec3::ZERO;
+            physics.on_ground = false;
+            physics.last_space_time = 0.0;
+        } else {
+            physics.last_space_time = now;
+        }
+    }
+
+    // ── Directional input ──
     let fwd = tf.forward();
     let right = tf.right();
-    let fwd = Vec3::new(fwd.x, 0.0, fwd.z).normalize_or_zero();
-    let right = Vec3::new(right.x, 0.0, right.z).normalize_or_zero();
+    let fwd_flat = Vec3::new(fwd.x, 0.0, fwd.z).normalize_or_zero();
+    let right_flat = Vec3::new(right.x, 0.0, right.z).normalize_or_zero();
 
-    let mut vel = Vec3::ZERO;
+    let mut wish_dir = Vec3::ZERO;
     if keys.pressed(KeyCode::KeyW) {
-        vel += fwd;
+        wish_dir += fwd_flat;
     }
     if keys.pressed(KeyCode::KeyS) {
-        vel -= fwd;
+        wish_dir -= fwd_flat;
     }
     if keys.pressed(KeyCode::KeyA) {
-        vel -= right;
+        wish_dir -= right_flat;
     }
     if keys.pressed(KeyCode::KeyD) {
-        vel += right;
+        wish_dir += right_flat;
     }
-    if keys.pressed(KeyCode::Space) {
-        vel += Vec3::Y;
+    wish_dir = wish_dir.normalize_or_zero();
+
+    if physics.fly_mode {
+        // ── Creative flight ──
+        let mut vel = wish_dir * speed;
+        if keys.pressed(KeyCode::Space) {
+            vel.y += speed;
+        }
+        if keys.pressed(KeyCode::ShiftLeft) {
+            vel.y -= speed;
+        }
+        tf.translation += vel * dt;
+    } else {
+        // ── Survival movement with collision ──
+        physics.velocity.x = wish_dir.x * speed;
+        physics.velocity.z = wish_dir.z * speed;
+
+        // Gravity
+        physics.velocity.y -= GRAVITY * dt;
+        physics.velocity.y = physics.velocity.y.max(-50.0); // terminal velocity
+
+        // Jump
+        if keys.just_pressed(KeyCode::Space) && physics.on_ground {
+            physics.velocity.y = JUMP_VELOCITY;
+            physics.on_ground = false;
+        }
+
+        // ── Collision resolution (per-axis) ──
+        let half_w = PLAYER_WIDTH * 0.5;
+        let h = PLAYER_HEIGHT;
+        let mut pos = tf.translation;
+
+        // X axis
+        let old_x = pos.x;
+        pos.x += physics.velocity.x * dt;
+        if check_aabb_collision(pos, half_w, h, &chunks_q) {
+            pos.x = old_x;
+            physics.velocity.x = 0.0;
+        }
+
+        // Z axis
+        let old_z = pos.z;
+        pos.z += physics.velocity.z * dt;
+        if check_aabb_collision(pos, half_w, h, &chunks_q) {
+            pos.z = old_z;
+            physics.velocity.z = 0.0;
+        }
+
+        // Y axis
+        let old_y = pos.y;
+        pos.y += physics.velocity.y * dt;
+        if check_aabb_collision(pos, half_w, h, &chunks_q) {
+            if physics.velocity.y <= 0.0 {
+                physics.on_ground = true;
+            }
+            pos.y = old_y;
+            physics.velocity.y = 0.0;
+        } else {
+            physics.on_ground = false;
+        }
+
+        tf.translation = pos;
     }
-    if keys.pressed(KeyCode::ShiftLeft) {
-        vel -= Vec3::Y;
-    }
-    tf.translation += vel.normalize_or_zero() * speed * dt;
 }
 
 fn grab_cursor(mut windows_q: Query<&mut Window>, mouse: Res<ButtonInput<MouseButton>>) {
@@ -644,32 +832,34 @@ pub fn frustum_culling_system(
 }
 
 // =============================================================================
-// HUD
+// HUD (crosshair + debug overlay)
 // =============================================================================
 
-#[derive(Component)]
-struct HudText;
+fn setup_hud(mut commands: Commands, asset_server: Res<AssetServer>) {
+    let font = asset_server.load("fonts/VCROSDMonoNova.ttf");
 
-fn setup_hud(mut commands: Commands) {
+    // ── Debug overlay (hidden by default, toggle with F3) ──
     commands.spawn((
-        HudText,
-        TextBundle::from_sections([
-            TextSection::new("Voxel Game\n", TextStyle { font_size: 22.0, color: Color::WHITE, ..default() }),
-            TextSection::new(
-                "WASD - move  |  Space - up  |  Shift - down  |  Ctrl - sprint\nClick to lock cursor  |  Esc - unlock  |  Esc again - menu",
-                TextStyle { font_size: 15.0, color: Color::srgb(0.75, 0.75, 0.75), ..default() },
-            ),
-        ])
+        DebugOverlay,
+        TextBundle::from_section(
+            "",
+            TextStyle {
+                font: font.clone(),
+                font_size: 16.0,
+                color: Color::srgb(0.9, 1.0, 0.9),
+            },
+        )
         .with_style(Style {
             position_type: PositionType::Absolute,
             top: Val::Px(10.0),
             left: Val::Px(10.0),
+            display: Display::None,
             ..default()
         }),
         InGameEntity,
     ));
 
-    // Crosshair
+    // ── Crosshair ──
     for (w, h, ml, mt) in [(2.0f32, 18.0f32, -1.0f32, -9.0f32), (18.0, 2.0, -9.0, -1.0)] {
         commands.spawn((
             NodeBundle {
@@ -695,6 +885,75 @@ fn setup_hud(mut commands: Commands) {
 }
 
 // =============================================================================
+// DEBUG SYSTEMS
+// =============================================================================
+
+fn toggle_debug(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut debug: ResMut<DebugState>,
+    mut query: Query<&mut Style, With<DebugOverlay>>,
+) {
+    if keys.just_pressed(KeyCode::F3) {
+        debug.visible = !debug.visible;
+        for mut style in &mut query {
+            style.display = if debug.visible {
+                Display::Flex
+            } else {
+                Display::None
+            };
+        }
+    }
+}
+
+fn update_debug_overlay(
+    debug: Res<DebugState>,
+    diagnostics: Res<DiagnosticsStore>,
+    player_q: Query<(&Transform, &PlayerPhysics), With<Player>>,
+    chunks_q: Query<&Chunk>,
+    mut text_q: Query<&mut Text, With<DebugOverlay>>,
+) {
+    if !debug.visible {
+        return;
+    }
+
+    let Ok((tf, physics)) = player_q.get_single() else {
+        return;
+    };
+    let Ok(mut text) = text_q.get_single_mut() else {
+        return;
+    };
+
+    let fps = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FPS)
+        .and_then(|d| d.smoothed())
+        .unwrap_or(0.0);
+
+    let frame_time = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FRAME_TIME)
+        .and_then(|d| d.smoothed())
+        .unwrap_or(0.0);
+
+    let chunk_count = chunks_q.iter().count();
+    let pos = tf.translation;
+    let mode = if physics.fly_mode {
+        "Полёт"
+    } else {
+        "Ходьба"
+    };
+
+    text.sections[0].value = format!(
+        "ФПС: {:.0}\nКадр: {:.1} мс\nXYZ: {:.1} / {:.1} / {:.1}\nЧанков: {}\nРежим: {} (2×Space)",
+        fps,
+        frame_time * 1000.0,
+        pos.x,
+        pos.y,
+        pos.z,
+        chunk_count,
+        mode,
+    );
+}
+
+// =============================================================================
 // MENU
 // =============================================================================
 
@@ -708,7 +967,8 @@ enum MenuButton {
     Quit,
 }
 
-fn setup_menu(mut commands: Commands) {
+fn setup_menu(mut commands: Commands, asset_server: Res<AssetServer>) {
+    let font = asset_server.load("fonts/VCROSDMonoNova.ttf");
     commands.insert_resource(ClearColor(Color::srgb(0.08, 0.08, 0.12)));
     commands.spawn((
         Camera2dBundle {
@@ -739,11 +999,11 @@ fn setup_menu(mut commands: Commands) {
         .with_children(|p| {
             p.spawn(
                 TextBundle::from_section(
-                    "Voxel Game",
+                    "Воксельная Игра",
                     TextStyle {
+                        font: font.clone(),
                         font_size: 80.0,
                         color: Color::srgb(0.95, 0.95, 0.5),
-                        ..default()
                     },
                 )
                 .with_style(Style {
@@ -752,27 +1012,12 @@ fn setup_menu(mut commands: Commands) {
                 }),
             );
 
-            spawn_btn(p, "Create World", MenuButton::CreateWorld);
-            spawn_btn(p, "Quit", MenuButton::Quit);
-
-            p.spawn(
-                TextBundle::from_section(
-                    "Click to lock cursor  |  Esc - unlock  |  Esc again - back to menu",
-                    TextStyle {
-                        font_size: 17.0,
-                        color: Color::srgb(0.5, 0.5, 0.5),
-                        ..default()
-                    },
-                )
-                .with_style(Style {
-                    margin: UiRect::top(Val::Px(40.0)),
-                    ..default()
-                }),
-            );
+            spawn_btn(p, "Создать Мир", MenuButton::CreateWorld, font.clone());
+            spawn_btn(p, "Выход", MenuButton::Quit, font);
         });
 }
 
-fn spawn_btn(parent: &mut ChildBuilder, label: &str, tag: MenuButton) {
+fn spawn_btn(parent: &mut ChildBuilder, label: &str, tag: MenuButton, font: Handle<Font>) {
     parent
         .spawn((
             tag,
@@ -794,9 +1039,9 @@ fn spawn_btn(parent: &mut ChildBuilder, label: &str, tag: MenuButton) {
             b.spawn(TextBundle::from_section(
                 label,
                 TextStyle {
+                    font,
                     font_size: 30.0,
                     color: Color::WHITE,
-                    ..default()
                 },
             ));
         });
@@ -845,14 +1090,17 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "Voxel Game".into(),
+                title: "Воксельная Игра".into(),
                 resolution: (1280.0, 720.0).into(),
+                present_mode: PresentMode::AutoVsync,
                 ..default()
             }),
             ..default()
         }))
+        .add_plugins(FrameTimeDiagnosticsPlugin)
         .init_state::<AppState>()
         .init_resource::<WorldManager>()
+        .init_resource::<DebugState>()
         .add_systems(Startup, setup_materials)
         // MENU
         .add_systems(OnEnter(AppState::Menu), setup_menu)
@@ -868,9 +1116,11 @@ fn main() {
                 frustum_culling_system,
                 rebuild_dirty_chunks.after(frustum_culling_system),
                 player_look,
-                player_move,
+                player_move.after(stream_chunks),
                 grab_cursor,
                 escape_key,
+                toggle_debug,
+                update_debug_overlay,
             )
                 .run_if(in_state(AppState::InGame)),
         )
