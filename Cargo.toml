@@ -1,0 +1,46 @@
+[package]
+name = "voxel_game"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bevy = "0.14"
+
+# ──────────────────────────────────────────────
+# Профили для максимальной производительности
+# ──────────────────────────────────────────────
+
+# Dev: быстрая сборка + оптимизированные зависимости
+[profile.dev]
+opt-level = 0
+
+[profile.dev.package."*"]
+opt-level = 3          # зависимости (включая Bevy) компилируются с O3
+
+# Release: максимальный перформанс
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# ──────────────────────────────────────────────
+# Фичи Bevy: убираем лишнее для слабого железа
+# Раскомментируйте нужные фичи под свои нужды
+# ──────────────────────────────────────────────
+# [dependencies.bevy]
+# version = "0.14"
+# default-features = false
+# features = [
+#     "bevy_winit",
+#     "bevy_render",
+#     "bevy_core_pipeline",
+#     "bevy_pbr",
+#     "bevy_ui",
+#     "bevy_text",
+#     "bevy_asset",
+#     "png",
+#     "x11",          # Linux X11
+#     # "wayland",    # Linux Wayland
+#     # "webgl2",     # WASM
+# ]
